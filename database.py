@@ -1,6 +1,7 @@
 import sqlite3
 import secrets
 import string
+
 from datetime import datetime, timedelta
 
 from config import DATABASE_PATH
@@ -9,44 +10,48 @@ from config import DATABASE_PATH
 def connect():
     conn = sqlite3.connect(
         DATABASE_PATH,
+        timeout=30,
         check_same_thread=False
     )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
 def init_db():
+
     conn = connect()
     cur = conn.cursor()
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
             mode TEXT DEFAULT 'user',
             blocked INTEGER DEFAULT 0,
             downloads INTEGER DEFAULT 0,
-            created_at TEXT
+            created_at TEXT NOT NULL
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE,
+            license_key TEXT UNIQUE NOT NULL,
             expires_at TEXT,
             enabled INTEGER DEFAULT 1,
-            created_at TEXT
+            created_at TEXT NOT NULL
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS activations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT,
-            user_id INTEGER,
-            activated_at TEXT
+            license_key TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            activated_at TEXT NOT NULL
         )
     """)
 
@@ -54,13 +59,16 @@ def init_db():
     conn.close()
 
 
-def register_user(user):
-    conn = connect()
-    cur = conn.cursor()
+# =========================================================
+# USERS
+# =========================================================
 
-    cur.execute("""
-        INSERT OR IGNORE INTO users
-        (
+def register_user(user):
+
+    conn = connect()
+
+    conn.execute("""
+        INSERT INTO users (
             user_id,
             username,
             first_name,
@@ -70,6 +78,10 @@ def register_user(user):
             created_at
         )
         VALUES (?, ?, ?, 'user', 0, 0, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            username = excluded.username,
+            first_name = excluded.first_name
     """, (
         user.id,
         user.username or "",
@@ -77,28 +89,19 @@ def register_user(user):
         datetime.now().isoformat()
     ))
 
-    cur.execute("""
-        UPDATE users
-        SET username = ?, first_name = ?
-        WHERE user_id = ?
-    """, (
-        user.username or "",
-        user.first_name or "",
-        user.id
-    ))
-
     conn.commit()
     conn.close()
 
 
 def get_user(user_id):
-    conn = connect()
-    cur = conn.cursor()
 
-    cur.execute(
-        "SELECT * FROM users WHERE user_id = ?",
-        (user_id,)
-    )
+    conn = connect()
+
+    cur = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE user_id = ?
+    """, (user_id,))
 
     row = cur.fetchone()
 
@@ -108,19 +111,24 @@ def get_user(user_id):
 
 
 def set_mode(user_id, mode):
+
     conn = connect()
 
     conn.execute("""
         UPDATE users
         SET mode = ?
         WHERE user_id = ?
-    """, (mode, user_id))
+    """, (
+        mode,
+        user_id
+    ))
 
     conn.commit()
     conn.close()
 
 
 def get_mode(user_id):
+
     row = get_user(user_id)
 
     if not row:
@@ -130,19 +138,24 @@ def get_mode(user_id):
 
 
 def set_blocked(user_id, blocked):
+
     conn = connect()
 
     conn.execute("""
         UPDATE users
         SET blocked = ?
         WHERE user_id = ?
-    """, (1 if blocked else 0, user_id))
+    """, (
+        1 if blocked else 0,
+        user_id
+    ))
 
     conn.commit()
     conn.close()
 
 
 def is_blocked(user_id):
+
     row = get_user(user_id)
 
     if not row:
@@ -152,6 +165,7 @@ def is_blocked(user_id):
 
 
 def increment_download(user_id):
+
     conn = connect()
 
     conn.execute("""
@@ -165,60 +179,112 @@ def increment_download(user_id):
 
 
 def total_users():
+
     conn = connect()
 
-    cur = conn.cursor()
+    cur = conn.execute("""
+        SELECT COUNT(*)
+        FROM users
+    """)
 
-    cur.execute("SELECT COUNT(*) FROM users")
-
-    result = cur.fetchone()[0]
+    value = cur.fetchone()[0]
 
     conn.close()
 
-    return result
+    return value
 
 
 def total_downloads():
+
     conn = connect()
 
-    cur = conn.cursor()
-
-    cur.execute("""
+    cur = conn.execute("""
         SELECT COALESCE(SUM(downloads), 0)
         FROM users
     """)
 
-    result = cur.fetchone()[0]
+    value = cur.fetchone()[0]
 
     conn.close()
 
-    return result
+    return value
 
 
-def generate_key(minutes=None):
+def all_users():
+
+    conn = connect()
+
+    cur = conn.execute("""
+        SELECT *
+        FROM users
+        ORDER BY created_at DESC
+    """)
+
+    rows = cur.fetchall()
+
+    conn.close()
+
+    return rows
+
+
+# =========================================================
+# LICENSE
+# =========================================================
+
+def generate_license(minutes=None):
+
     alphabet = string.ascii_uppercase + string.digits
 
-    key = (
-        "NUTHH-"
-        + "".join(secrets.choice(alphabet) for _ in range(5))
-        + "-"
-        + "".join(secrets.choice(alphabet) for _ in range(5))
-        + "-"
-        + "".join(secrets.choice(alphabet) for _ in range(5))
-    )
+    while True:
+
+        key = (
+            "NUTHH-"
+            + "".join(
+                secrets.choice(alphabet)
+                for _ in range(5)
+            )
+            + "-"
+            + "".join(
+                secrets.choice(alphabet)
+                for _ in range(5)
+            )
+            + "-"
+            + "".join(
+                secrets.choice(alphabet)
+                for _ in range(5)
+            )
+        )
+
+        conn = connect()
+
+        cur = conn.execute("""
+            SELECT id
+            FROM licenses
+            WHERE license_key = ?
+        """, (key,))
+
+        exists = cur.fetchone()
+
+        conn.close()
+
+        if not exists:
+            break
 
     if minutes is None:
+
         expires_at = None
+
     else:
+
         expires_at = (
-            datetime.now() + timedelta(minutes=minutes)
+            datetime.now()
+            + timedelta(minutes=minutes)
         ).isoformat()
 
     conn = connect()
 
     conn.execute("""
-        INSERT INTO licenses
-        (
+        INSERT INTO licenses (
             license_key,
             expires_at,
             enabled,
@@ -237,45 +303,58 @@ def generate_key(minutes=None):
     return key
 
 
-def activate_license(user_id, key):
-    conn = connect()
-    cur = conn.cursor()
+def get_license(key):
 
-    cur.execute("""
+    conn = connect()
+
+    cur = conn.execute("""
         SELECT *
         FROM licenses
         WHERE license_key = ?
-    """, (key.strip().upper(),))
+    """, (
+        key.strip().upper(),
+    ))
 
-    license_row = cur.fetchone()
+    row = cur.fetchone()
 
-    if not license_row:
-        conn.close()
+    conn.close()
+
+    return row
+
+
+def activate_license(user_id, key):
+
+    key = key.strip().upper()
+
+    row = get_license(key)
+
+    if not row:
         return False, "❌ License key not found."
 
-    if not license_row["enabled"]:
-        conn.close()
-        return False, "❌ This license is disabled."
+    if not row["enabled"]:
+        return False, "🔴 This license is disabled."
 
-    expires_at = license_row["expires_at"]
+    if row["expires_at"]:
 
-    if expires_at:
-        expiry = datetime.fromisoformat(expires_at)
+        expiry = datetime.fromisoformat(
+            row["expires_at"]
+        )
 
         if expiry <= datetime.now():
-            conn.close()
+
             return False, "⏰ This license has expired."
 
-    cur.execute("""
-        INSERT INTO activations
-        (
+    conn = connect()
+
+    conn.execute("""
+        INSERT INTO activations (
             license_key,
             user_id,
             activated_at
         )
         VALUES (?, ?, ?)
     """, (
-        key.strip().upper(),
+        key,
         user_id,
         datetime.now().isoformat()
     ))
@@ -287,14 +366,14 @@ def activate_license(user_id, key):
 
 
 def has_valid_license(user_id):
-    conn = connect()
-    cur = conn.cursor()
 
-    cur.execute("""
+    conn = connect()
+
+    cur = conn.execute("""
         SELECT l.*
         FROM licenses l
         INNER JOIN activations a
-        ON l.license_key = a.license_key
+            ON a.license_key = l.license_key
         WHERE a.user_id = ?
         AND l.enabled = 1
         ORDER BY a.id DESC
@@ -311,17 +390,21 @@ def has_valid_license(user_id):
         if row["expires_at"] is None:
             return True
 
-        if datetime.fromisoformat(row["expires_at"]) > now:
+        expiry = datetime.fromisoformat(
+            row["expires_at"]
+        )
+
+        if expiry > now:
             return True
 
     return False
 
 
 def list_licenses():
-    conn = connect()
-    cur = conn.cursor()
 
-    cur.execute("""
+    conn = connect()
+
+    cur = conn.execute("""
         SELECT *
         FROM licenses
         ORDER BY id DESC
@@ -334,76 +417,141 @@ def list_licenses():
     return rows
 
 
-def set_license_enabled(key, enabled):
+def enable_license(key):
+
     conn = connect()
 
-    conn.execute("""
+    cur = conn.execute("""
         UPDATE licenses
-        SET enabled = ?
+        SET enabled = 1
         WHERE license_key = ?
     """, (
-        1 if enabled else 0,
-        key.strip().upper()
+        key.strip().upper(),
     ))
 
     conn.commit()
+
+    changed = cur.rowcount
+
     conn.close()
+
+    return changed > 0
+
+
+def disable_license(key):
+
+    conn = connect()
+
+    cur = conn.execute("""
+        UPDATE licenses
+        SET enabled = 0
+        WHERE license_key = ?
+    """, (
+        key.strip().upper(),
+    ))
+
+    conn.commit()
+
+    changed = cur.rowcount
+
+    conn.close()
+
+    return changed > 0
 
 
 def delete_license(key):
-    conn = connect()
 
-    conn.execute("""
-        DELETE FROM licenses
-        WHERE license_key = ?
-    """, (key.strip().upper(),))
+    key = key.strip().upper()
+
+    conn = connect()
 
     conn.execute("""
         DELETE FROM activations
         WHERE license_key = ?
-    """, (key.strip().upper(),))
+    """, (key,))
+
+    cur = conn.execute("""
+        DELETE FROM licenses
+        WHERE license_key = ?
+    """, (key,))
 
     conn.commit()
+
+    changed = cur.rowcount
+
     conn.close()
+
+    return changed > 0
 
 
 def extend_license(key, minutes):
-    conn = connect()
-    cur = conn.cursor()
 
-    cur.execute("""
-        SELECT expires_at
-        FROM licenses
-        WHERE license_key = ?
-    """, (key.strip().upper(),))
+    key = key.strip().upper()
 
-    row = cur.fetchone()
+    row = get_license(key)
 
     if not row:
-        conn.close()
         return False
 
     if row["expires_at"] is None:
-        conn.close()
         return True
 
-    current_expiry = datetime.fromisoformat(row["expires_at"])
+    expiry = datetime.fromisoformat(
+        row["expires_at"]
+    )
 
-    if current_expiry < datetime.now():
-        current_expiry = datetime.now()
+    if expiry < datetime.now():
+        expiry = datetime.now()
 
-    new_expiry = current_expiry + timedelta(minutes=minutes)
+    expiry += timedelta(
+        minutes=minutes
+    )
 
-    cur.execute("""
+    conn = connect()
+
+    conn.execute("""
         UPDATE licenses
         SET expires_at = ?
         WHERE license_key = ?
     """, (
-        new_expiry.isoformat(),
-        key.strip().upper()
+        expiry.isoformat(),
+        key
     ))
 
     conn.commit()
     conn.close()
 
     return True
+
+
+def license_count():
+
+    conn = connect()
+
+    cur = conn.execute("""
+        SELECT COUNT(*)
+        FROM licenses
+    """)
+
+    value = cur.fetchone()[0]
+
+    conn.close()
+
+    return value
+
+
+def active_license_count():
+
+    conn = connect()
+
+    cur = conn.execute("""
+        SELECT COUNT(*)
+        FROM licenses
+        WHERE enabled = 1
+    """)
+
+    value = cur.fetchone()[0]
+
+    conn.close()
+
+    return value
