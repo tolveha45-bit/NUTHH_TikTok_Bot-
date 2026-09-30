@@ -6,7 +6,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 try:
-    OWNER_ID = int(os.getenv("8736435737", "0"))
+    OWNER_ID = int(os.getenv("OWNER_ID", "0").strip())
 except ValueError:
     OWNER_ID = 0
 
