@@ -696,38 +696,7 @@ def receive_url(message):
         user_id
     )
 
-    if not state:
-        return
 
-    if not can_download(user_id):
-
-        USER_STATES.pop(
-            user_id,
-            None
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "🔒 License expired.",
-            reply_markup=user_menu(
-                user_id
-            )
-        )
-
-        return
-
-    url = message.text.strip()
-
-    if not (
-        url.startswith("http://")
-        or url.startswith("https://")
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "❌ Please send a valid URL.",
-            reply_markup=cancel_menu()
-        )
 
         return
 
