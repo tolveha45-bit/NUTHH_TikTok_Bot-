@@ -1,313 +1,342 @@
 import os
+import html
 import time
 import threading
-
 import telebot
+
 from telebot import types
 
 import config
 import database
+import license
+import downloader
 
-from license import can_download
 
-from downloader import (
-    Downloader,
-    DownloadCancelled,
-    cleanup
-)
+# =========================================================
+# NUTHH TELEGRAM DOWNLOADER BOT
+# =========================================================
 
+BOT_TOKEN = config.BOT_TOKEN
+OWNER_ID = int(config.OWNER_ID)
 
 bot = telebot.TeleBot(
-    config.BOT_TOKEN,
-    parse_mode="HTML"
+    BOT_TOKEN,
+    parse_mode="HTML",
+    threaded=True
 )
 
-database.init_db()
-
-
-# =========================================================
-# GLOBAL STATE
-# =========================================================
-
+# Bot running state
 BOT_RUNNING = True
 
+# User temporary states
 USER_STATES = {}
 
-ACTIVE_DOWNLOADS = {}
+# Download locks
+DOWNLOAD_LOCKS = {}
 
-CANCEL_EVENTS = {}
+# Store download retry information
+LAST_DOWNLOAD = {}
 
 
 # =========================================================
-# OWNER
+# STATE HELPERS
+# =========================================================
+
+def set_state(user_id, state, data=None):
+    USER_STATES[user_id] = {
+        "state": state,
+        "data": data or {}
+    }
+
+
+def get_state(user_id):
+    return USER_STATES.get(user_id)
+
+
+def clear_state(user_id):
+    USER_STATES.pop(user_id, None)
+
+
+# =========================================================
+# DOWNLOAD LOCK
+# =========================================================
+
+def is_downloading(user_id):
+    return user_id in DOWNLOAD_LOCKS
+
+
+def start_download_lock(user_id):
+    DOWNLOAD_LOCKS[user_id] = True
+
+
+def stop_download_lock(user_id):
+    DOWNLOAD_LOCKS.pop(user_id, None)
+
+
+# =========================================================
+# USER MODE
 # =========================================================
 
 def is_owner(user_id):
+    return int(user_id) == OWNER_ID
 
-    return user_id == config.OWNER_ID
+
+def get_user_mode(user_id):
+    if not is_owner(user_id):
+        return "user"
+
+    try:
+        mode = database.get_user_mode(user_id)
+
+        if mode:
+            return mode
+
+    except Exception:
+        pass
+
+    return "owner"
+
+
+def set_user_mode(user_id, mode):
+    try:
+        database.set_user_mode(user_id, mode)
+    except Exception:
+        pass
 
 
 # =========================================================
-# USER MENU
+# BOT STATUS
 # =========================================================
 
-def user_menu(user_id):
+def bot_is_running():
+    return BOT_RUNNING
 
-    kb = types.ReplyKeyboardMarkup(
+
+def set_bot_status(status):
+    global BOT_RUNNING
+    BOT_RUNNING = bool(status)
+
+
+# =========================================================
+# KEYBOARDS
+# =========================================================
+
+def user_menu():
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
+    keyboard.row(
         "🎬 Download Video",
         "🎵 Download MP3"
     )
 
-    kb.row(
+    keyboard.row(
         "🔑 Activate Key",
-        "👤 My Account"
+        "📋 My License"
     )
 
-    kb.row(
-        "📊 My Downloads",
-        "❓ Help"
+    keyboard.row(
+        "🔄 Retry Last Download",
+        "ℹ️ Help"
     )
 
-    if is_owner(user_id):
-        kb.row(
-            "👑 Owner Mode"
-        )
+    if is_owner_from_context():
+        pass
 
-    return kb
+    return keyboard
 
-
-# =========================================================
-# OWNER MENU
-# =========================================================
 
 def owner_menu():
-
-    kb = types.ReplyKeyboardMarkup(
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
-        "🔑 Key Control",
-        "🤖 Bot Control"
+    keyboard.row(
+        "🎬 Download Video",
+        "🎵 Download MP3"
     )
 
-    kb.row(
-        "👥 User Management",
-        "📊 Statistics"
+    keyboard.row(
+        "🔑 License Control",
+        "👥 User Management"
     )
 
-    kb.row(
-        "⚙️ Settings",
+    keyboard.row(
+        "📊 Statistics",
+        "⚙️ Bot Control"
+    )
+
+    keyboard.row(
         "👤 User Mode"
     )
 
-    return kb
+    return keyboard
 
 
-# =========================================================
-# VIDEO MENU
-# =========================================================
-
-def video_menu():
-
-    kb = types.ReplyKeyboardMarkup(
+def owner_mode_menu():
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
-        "🟢 Smooth",
-        "720p"
+    keyboard.row(
+        "🎬 Download Video",
+        "🎵 Download MP3"
     )
 
-    kb.row(
-        "1080p",
-        "4K / Source"
+    keyboard.row(
+        "🔑 License Control",
+        "👥 User Management"
     )
 
-    kb.row(
-        "❌ Cancel"
+    keyboard.row(
+        "📊 Statistics",
+        "⚙️ Bot Control"
     )
 
-    return kb
+    keyboard.row(
+        "👤 User Mode"
+    )
+
+    return keyboard
 
 
-# =========================================================
-# MP3 MENU
-# =========================================================
-
-def mp3_menu():
-
-    kb = types.ReplyKeyboardMarkup(
+def user_mode_menu():
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
-        "🎵 128 kbps",
-        "🎵 192 kbps"
+    keyboard.row(
+        "🎬 Download Video",
+        "🎵 Download MP3"
     )
 
-    kb.row(
-        "🎵 320 kbps",
-        "❌ Cancel"
+    keyboard.row(
+        "🔑 Activate Key",
+        "📋 My License"
     )
 
-    return kb
+    keyboard.row(
+        "🔄 Retry Last Download",
+        "ℹ️ Help"
+    )
+
+    if is_owner_from_context():
+        keyboard.row(
+            "👑 Owner Mode"
+        )
+
+    return keyboard
+
+
+def is_owner_from_context():
+    return False
 
 
 # =========================================================
-# CANCEL MENU
+# QUALITY BUTTONS
 # =========================================================
 
-def cancel_menu():
+def video_quality_menu():
+    keyboard = types.InlineKeyboardMarkup()
 
-    kb = types.ReplyKeyboardMarkup(
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "📱 Smooth",
+            callback_data="video_smooth"
+        ),
+        types.InlineKeyboardButton(
+            "720p",
+            callback_data="video_720"
+        )
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "1080p",
+            callback_data="video_1080"
+        ),
+        types.InlineKeyboardButton(
+            "4K / Source",
+            callback_data="video_source"
+        )
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "❌ Cancel",
+            callback_data="cancel_download"
+        )
+    )
+
+    return keyboard
+
+
+def mp3_quality_menu():
+    keyboard = types.InlineKeyboardMarkup()
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "🎵 128 kbps",
+            callback_data="mp3_128"
+        ),
+        types.InlineKeyboardButton(
+            "🎵 192 kbps",
+            callback_data="mp3_192"
+        )
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "🎵 320 kbps",
+            callback_data="mp3_320"
+        )
+    )
+
+    keyboard.row(
+        types.InlineKeyboardButton(
+            "❌ Cancel",
+            callback_data="cancel_download"
+        )
+    )
+
+    return keyboard
+
+
+# =========================================================
+# LICENSE MENU
+# =========================================================
+
+def license_menu():
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
-        "❌ Cancel"
-    )
-
-    return kb
-
-
-# =========================================================
-# KEY MENU
-# =========================================================
-
-def key_menu():
-
-    kb = types.ReplyKeyboardMarkup(
-        resize_keyboard=True
-    )
-
-    kb.row(
+    keyboard.row(
         "➕ Generate Key",
-        "📋 All Keys"
+        "🔍 Search Key"
     )
 
-    kb.row(
-        "🔍 Search Key",
-        "⏰ Extend Key"
+    keyboard.row(
+        "⏱ Extend Key",
+        "🚫 Disable Key"
     )
 
-    kb.row(
+    keyboard.row(
         "🟢 Enable Key",
-        "🔴 Disable Key"
+        "🗑 Delete Key"
     )
 
-    kb.row(
-        "🗑️ Delete Key",
-        "📈 Key Statistics"
+    keyboard.row(
+        "📋 List Keys",
+        "📊 Key Statistics"
     )
 
-    kb.row(
+    keyboard.row(
         "🔙 Owner Menu"
     )
 
-    return kb
-
-
-# =========================================================
-# KEY DURATION
-# =========================================================
-
-def duration_menu():
-
-    kb = types.ReplyKeyboardMarkup(
-        resize_keyboard=True
-    )
-
-    kb.row(
-        "⏱ 1 Minute",
-        "⏱ 5 Minutes"
-    )
-
-    kb.row(
-        "⏱ 10 Minutes",
-        "⏱ 30 Minutes"
-    )
-
-    kb.row(
-        "🕐 1 Hour",
-        "🕐 6 Hours"
-    )
-
-    kb.row(
-        "📅 1 Day",
-        "📅 7 Days"
-    )
-
-    kb.row(
-        "📅 30 Days",
-        "📅 90 Days"
-    )
-
-    kb.row(
-        "♾️ Lifetime"
-    )
-
-    kb.row(
-        "🔙 Key Control"
-    )
-
-    return kb
-
-
-DURATIONS = {
-
-    "⏱ 1 Minute": 1,
-
-    "⏱ 5 Minutes": 5,
-
-    "⏱ 10 Minutes": 10,
-
-    "⏱ 30 Minutes": 30,
-
-    "🕐 1 Hour": 60,
-
-    "🕐 6 Hours": 360,
-
-    "📅 1 Day": 1440,
-
-    "📅 7 Days": 10080,
-
-    "📅 30 Days": 43200,
-
-    "📅 90 Days": 129600,
-
-    "♾️ Lifetime": None
-}
-
-
-# =========================================================
-# BOT CONTROL MENU
-# =========================================================
-
-def bot_control_menu():
-
-    kb = types.ReplyKeyboardMarkup(
-        resize_keyboard=True
-    )
-
-    kb.row(
-        "▶️ Start Bot",
-        "⏸️ Stop Bot"
-    )
-
-    kb.row(
-        "📊 Bot Status"
-    )
-
-    kb.row(
-        "🔙 Owner Menu"
-    )
-
-    return kb
+    return keyboard
 
 
 # =========================================================
@@ -315,85 +344,125 @@ def bot_control_menu():
 # =========================================================
 
 def user_management_menu():
-
-    kb = types.ReplyKeyboardMarkup(
+    keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True
     )
 
-    kb.row(
-        "👥 All Users",
-        "📊 User Statistics"
+    keyboard.row(
+        "👥 List Users",
+        "🔍 Search User"
     )
 
-    kb.row(
+    keyboard.row(
         "🚫 Ban User",
         "🟢 Unban User"
     )
 
-    kb.row(
+    keyboard.row(
         "🔙 Owner Menu"
     )
 
-    return kb
+    return keyboard
 
 
 # =========================================================
-# REGISTER
+# BOT CONTROL MENU
 # =========================================================
 
-def register(message):
+def bot_control_menu():
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
 
-    database.register_user(
-        message.from_user
+    keyboard.row(
+        "▶️ Start Bot",
+        "⏹ Stop Bot"
+    )
+
+    keyboard.row(
+        "📊 Bot Status",
+        "🔙 Owner Menu"
+    )
+
+    return keyboard
+
+
+# =========================================================
+# /START
+# =========================================================
+
+@bot.message_handler(commands=["start"])
+def start_command(message):
+
+    user_id = message.from_user.id
+
+    try:
+        database.register_user(
+            user_id=user_id,
+            username=message.from_user.username,
+            first_name=message.from_user.first_name or "",
+            last_name=message.from_user.last_name or ""
+        )
+    except Exception:
+        pass
+
+    clear_state(user_id)
+
+    # Owner
+    if is_owner(user_id):
+
+        mode = get_user_mode(user_id)
+
+        if mode == "user":
+            bot.send_message(
+                message.chat.id,
+                "👤 <b>User Mode</b>\n\n"
+                "You are currently using User Mode.",
+                reply_markup=user_mode_menu()
+            )
+            return
+
+        bot.send_message(
+            message.chat.id,
+            "👑 <b>NUTHH Downloader</b>\n\n"
+            "Owner Mode activated.",
+            reply_markup=owner_menu()
+        )
+        return
+
+    # Normal user
+    bot.send_message(
+        message.chat.id,
+        "👋 <b>Welcome to NUTHH Downloader</b>\n\n"
+        "Please activate a valid license before downloading.",
+        reply_markup=user_menu()
     )
 
 
 # =========================================================
-# START
+# /HELP
 # =========================================================
 
-@bot.message_handler(
-    commands=["start"]
-)
-def start(message):
+@bot.message_handler(commands=["help"])
+def help_command(message):
 
-    register(message)
+    text = (
+        "ℹ️ <b>NUTHH Downloader Help</b>\n\n"
+        "🎬 Download Video\n"
+        "Download video with quality selection.\n\n"
+        "🎵 Download MP3\n"
+        "Convert video audio to MP3.\n\n"
+        "🔑 Activate Key\n"
+        "Activate your license key.\n\n"
+        "🔄 Retry Last Download\n"
+        "Retry the previous download.\n\n"
+        "All functions are available from the buttons."
+    )
 
-    user_id = message.from_user.id
-
-    if is_owner(user_id):
-
-        mode = database.get_mode(
-            user_id
-        )
-
-        if mode == "owner":
-
-            bot.send_message(
-                message.chat.id,
-                "👑 <b>Owner Mode</b>",
-                reply_markup=owner_menu()
-            )
-
-        else:
-
-            bot.send_message(
-                message.chat.id,
-                "👤 <b>User Mode</b>",
-                reply_markup=user_menu(
-                    user_id
-                )
-            )
-
-    else:
-
-        bot.send_message(
-            message.chat.id,
-            "👋 <b>Welcome to NUTHH Downloader</b>",
-            reply_markup=user_menu(
-                user_id
-            )
-        )
+    bot.send_message(
+        message.chat.id,
+        text
+    )
 
 
 # =========================================================
@@ -401,808 +470,920 @@ def start(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "👑 Owner Mode"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "👤 User Mode"
 )
-def owner_mode(message):
+def owner_to_user_mode(message):
 
-    database.set_mode(
-        message.from_user.id,
-        "owner"
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "👑 <b>Owner Mode Enabled</b>",
-        reply_markup=owner_menu()
-    )
-
-
-# =========================================================
-# USER MODE
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "👤 User Mode"
-)
-def user_mode(message):
-
-    database.set_mode(
+    set_user_mode(
         message.from_user.id,
         "user"
     )
 
     bot.send_message(
         message.chat.id,
-        "👤 <b>User Mode Enabled</b>",
-        reply_markup=user_menu(
-            message.from_user.id
-        )
+        "👤 <b>User Mode Activated</b>\n\n"
+        "Owner controls are hidden.\n"
+        "You can switch back using 👑 Owner Mode.",
+        reply_markup=user_mode_menu()
     )
 
 
 # =========================================================
-# VIDEO
+# USER -> OWNER MODE
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        m.text == "🎬 Download Video"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "👑 Owner Mode"
 )
-def video_start(message):
+def user_to_owner_mode(message):
 
-    register(message)
+    set_user_mode(
+        message.from_user.id,
+        "owner"
+    )
 
-    if not BOT_RUNNING and not is_owner(
-        message.from_user.id
-    ):
+    bot.send_message(
+        message.chat.id,
+        "👑 <b>Owner Mode Activated</b>",
+        reply_markup=owner_menu()
+    )
+
+
+# =========================================================
+# LICENSE CHECK
+# =========================================================
+
+def check_license(user_id):
+
+    try:
+        return database.has_valid_license(user_id)
+    except Exception:
+        return False
+
+
+# =========================================================
+# DOWNLOAD VIDEO BUTTON
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    message.text == "🎬 Download Video"
+)
+def download_video_button(message):
+
+    user_id = message.from_user.id
+
+    if not bot_is_running() and not is_owner(user_id):
 
         bot.send_message(
             message.chat.id,
-            "⏸️ Bot is currently stopped.",
-            reply_markup=user_menu(
-                message.from_user.id
-            )
+            "⏹ <b>Bot is currently stopped.</b>\n\n"
+            "Please try again later."
         )
 
         return
 
-    if not can_download(
-        message.from_user.id
-    ):
+    if not is_owner(user_id):
 
-        bot.send_message(
-            message.chat.id,
-            (
+        if not check_license(user_id):
+
+            bot.send_message(
+                message.chat.id,
                 "🔒 <b>License Required</b>\n\n"
-                "Please activate a valid key first."
-            ),
-            reply_markup=user_menu(
-                message.from_user.id
+                "Please activate a valid license first.",
+                reply_markup=user_mode_menu()
             )
-        )
 
-        return
+            return
 
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "video_quality"
-    }
+    set_state(
+        user_id,
+        "waiting_video_url"
+    )
 
     bot.send_message(
         message.chat.id,
-        "🎬 <b>Select Video Quality</b>",
-        reply_markup=video_menu()
+        "🎬 <b>Download Video</b>\n\n"
+        "Send the video URL.",
+        reply_markup=types.ReplyKeyboardRemove()
     )
 
 
 # =========================================================
-# VIDEO QUALITY
+# DOWNLOAD MP3 BUTTON
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        m.text in [
-            "🟢 Smooth",
-            "720p",
-            "1080p",
-            "4K / Source"
-        ]
+    func=lambda message:
+    message.text == "🎵 Download MP3"
 )
-def video_quality(message):
-
-    state = USER_STATES.get(
-        message.from_user.id
-    )
-
-    if not state:
-        return
-
-    quality = {
-        "🟢 Smooth": "smooth",
-        "720p": "720",
-        "1080p": "1080",
-        "4K / Source": "source"
-    }[message.text]
-
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "video_url",
-        "quality": quality
-    }
-
-    bot.send_message(
-        message.chat.id,
-        (
-            "🔗 <b>Send Video URL</b>\n\n"
-            "You can send a long video URL."
-        ),
-        reply_markup=cancel_menu()
-    )
-
-
-# =========================================================
-# MP3
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "🎵 Download MP3"
-)
-def mp3_start(message):
-
-    register(message)
-
-    if not BOT_RUNNING and not is_owner(
-        message.from_user.id
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "⏸️ Bot is currently stopped.",
-            reply_markup=user_menu(
-                message.from_user.id
-            )
-        )
-
-        return
-
-    if not can_download(
-        message.from_user.id
-    ):
-
-        bot.send_message(
-            message.chat.id,
-            "🔒 <b>Valid license required.</b>",
-            reply_markup=user_menu(
-                message.from_user.id
-            )
-        )
-
-        return
-
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "mp3_quality"
-    }
-
-    bot.send_message(
-        message.chat.id,
-        "🎵 <b>Select MP3 Quality</b>",
-        reply_markup=mp3_menu()
-    )
-
-
-# =========================================================
-# MP3 QUALITY
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text in [
-            "🎵 128 kbps",
-            "🎵 192 kbps",
-            "🎵 320 kbps"
-        ]
-)
-def mp3_quality(message):
-
-    state = USER_STATES.get(
-        message.from_user.id
-    )
-
-    if not state:
-        return
-
-    quality = {
-        "🎵 128 kbps": "128",
-        "🎵 192 kbps": "192",
-        "🎵 320 kbps": "320"
-    }[message.text]
-
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "mp3_url",
-        "quality": quality
-    }
-
-    bot.send_message(
-        message.chat.id,
-        "🔗 <b>Send Video URL</b>",
-        reply_markup=cancel_menu()
-    )
-
-
-# =========================================================
-# CANCEL
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "❌ Cancel"
-)
-def cancel(message):
+def download_mp3_button(message):
 
     user_id = message.from_user.id
 
-    event = CANCEL_EVENTS.get(
-        user_id
-    )
+    if not bot_is_running() and not is_owner(user_id):
 
-    if event:
-        event.set()
-
-    USER_STATES.pop(
-        user_id,
-        None
-    )
-
-    bot.send_message(
-        message.chat.id,
-        "❌ Cancelled.",
-        reply_markup=user_menu(
-            user_id
+        bot.send_message(
+            message.chat.id,
+            "⏹ <b>Bot is currently stopped.</b>"
         )
-    )
-
-
-# =========================================================
-# URL PROCESS
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        USER_STATES.get(
-            m.from_user.id,
-            {}
-        ).get("type")
-        in [
-            "video_url",
-            "mp3_url"
-        ]
-)
-def receive_url(message):
-
-    user_id = message.from_user.id
-
-    state = USER_STATES.get(
-        user_id
-    )
-
-
 
         return
 
-    action = state["type"]
+    if not is_owner(user_id):
 
-    USER_STATES.pop(
+        if not check_license(user_id):
+
+            bot.send_message(
+                message.chat.id,
+                "🔒 <b>License Required</b>\n\n"
+                "Please activate a valid license first.",
+                reply_markup=user_mode_menu()
+            )
+
+            return
+
+    set_state(
         user_id,
-        None
+        "waiting_mp3_url"
     )
-
-    event = threading.Event()
-
-    CANCEL_EVENTS[
-        user_id
-    ] = event
 
     bot.send_message(
         message.chat.id,
-        "🔎 <b>Preparing download...</b>",
-        reply_markup=cancel_menu()
+        "🎵 <b>Download MP3</b>\n\n"
+        "Send the video URL.",
+        reply_markup=types.ReplyKeyboardRemove()
     )
+
+
+# =========================================================
+# ACTIVATE LICENSE
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    message.text == "🔑 Activate Key"
+)
+def activate_key_button(message):
+
+    set_state(
+        message.from_user.id,
+        "activate_key"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🔑 <b>Activate License</b>\n\n"
+        "Please send your license key."
+    )
+
+
+# =========================================================
+# MY LICENSE
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    message.text == "📋 My License"
+)
+def my_license_button(message):
+
+    user_id = message.from_user.id
+
+    try:
+        licenses = database.get_user_licenses(user_id)
+    except Exception:
+        licenses = []
+
+    if not licenses:
+
+        bot.send_message(
+            message.chat.id,
+            "🔒 You do not have an active license."
+        )
+
+        return
+
+    text = "📋 <b>Your License</b>\n\n"
+
+    for item in licenses:
+
+        try:
+            key = item["key"]
+            status = item["status"]
+            expires = item["expires_at"]
+
+        except Exception:
+            continue
+
+        text += (
+            f"🔑 <code>{html.escape(str(key))}</code>\n"
+            f"Status: {html.escape(str(status))}\n"
+            f"Expires: {html.escape(str(expires))}\n\n"
+        )
+
+    bot.send_message(
+        message.chat.id,
+        text
+    )
+
+
+# =========================================================
+# RETRY LAST DOWNLOAD
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    message.text == "🔄 Retry Last Download"
+)
+def retry_last_download(message):
+
+    user_id = message.from_user.id
+
+    if not is_owner(user_id) and not check_license(user_id):
+
+        bot.send_message(
+            message.chat.id,
+            "🔒 Valid license required."
+        )
+
+        return
+
+    last = LAST_DOWNLOAD.get(user_id)
+
+    if not last:
+
+        bot.send_message(
+            message.chat.id,
+            "ℹ️ There is no previous download to retry."
+        )
+
+        return
+
+    if last["type"] == "video":
+
+        set_state(
+            user_id,
+            "retry_video_quality",
+            {
+                "url": last["url"]
+            }
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 <b>Select video quality:</b>",
+            reply_markup=video_quality_menu()
+        )
+
+    else:
+
+        set_state(
+            user_id,
+            "retry_mp3_quality",
+            {
+                "url": last["url"]
+            }
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "🔄 <b>Select MP3 quality:</b>",
+            reply_markup=mp3_quality_menu()
+        )
+
+
+# =========================================================
+# URL STATE HANDLER
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    get_state(message.from_user.id) is not None
+)
+def state_handler(message):
+
+    user_id = message.from_user.id
+    state_data = get_state(user_id)
+
+    if not state_data:
+        return
+
+    state = state_data["state"]
+    data = state_data["data"]
+
+    # -----------------------------------------------------
+    # ACTIVATE KEY
+    # -----------------------------------------------------
+
+    if state == "activate_key":
+
+        key = message.text.strip()
+
+        try:
+            result = license.activate_license(
+                user_id,
+                key
+            )
+        except Exception as error:
+            result = {
+                "success": False,
+                "message": str(error)
+            }
+
+        clear_state(user_id)
+
+        if result.get("success"):
+
+            bot.send_message(
+                message.chat.id,
+                "✅ <b>License Activated</b>\n\n"
+                "You can now download videos.",
+                reply_markup=user_mode_menu()
+            )
+
+        else:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ <b>License Activation Failed</b>\n\n"
+                f"{html.escape(str(result.get('message', 'Invalid key.')))}",
+                reply_markup=user_mode_menu()
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # VIDEO URL
+    # -----------------------------------------------------
+
+    if state == "waiting_video_url":
+
+        url = message.text.strip()
+
+        if not url.startswith(("http://", "https://")):
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Please send a valid URL."
+            )
+
+            return
+
+        set_state(
+            user_id,
+            "video_quality",
+            {
+                "url": url
+            }
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "🎬 <b>Select Video Quality</b>",
+            reply_markup=video_quality_menu()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # MP3 URL
+    # -----------------------------------------------------
+
+    if state == "waiting_mp3_url":
+
+        url = message.text.strip()
+
+        if not url.startswith(("http://", "https://")):
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Please send a valid URL."
+            )
+
+            return
+
+        set_state(
+            user_id,
+            "mp3_quality",
+            {
+                "url": url
+            }
+        )
+
+        bot.send_message(
+            message.chat.id,
+            "🎵 <b>Select MP3 Quality</b>",
+            reply_markup=mp3_quality_menu()
+        )
+
+        return
+
+
+# =========================================================
+# CALLBACK QUERY
+# =========================================================
+
+@bot.callback_query_handler(
+    func=lambda call: True
+)
+def callback_handler(call):
+
+    user_id = call.from_user.id
+
+    try:
+        bot.answer_callback_query(call.id)
+    except Exception:
+        pass
+
+    # -----------------------------------------------------
+    # CANCEL
+    # -----------------------------------------------------
+
+    if call.data == "cancel_download":
+
+        clear_state(user_id)
+
+        try:
+            bot.edit_message_text(
+                "❌ Download cancelled.",
+                call.message.chat.id,
+                call.message.message_id
+            )
+        except Exception:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Download cancelled."
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # VIDEO QUALITY
+    # -----------------------------------------------------
+
+    if call.data.startswith("video_"):
+
+        quality = call.data.replace(
+            "video_",
+            ""
+        )
+
+        state_data = get_state(user_id)
+
+        if not state_data:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Session expired. Please start again."
+            )
+            return
+
+        url = state_data["data"].get("url")
+
+        if not url:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ URL not found."
+            )
+            clear_state(user_id)
+            return
+
+        clear_state(user_id)
+
+        start_download(
+            user_id=user_id,
+            chat_id=call.message.chat.id,
+            url=url,
+            download_type="video",
+            quality=quality
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # MP3 QUALITY
+    # -----------------------------------------------------
+
+    if call.data.startswith("mp3_"):
+
+        quality = call.data.replace(
+            "mp3_",
+            ""
+        )
+
+        state_data = get_state(user_id)
+
+        if not state_data:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ Session expired."
+            )
+            return
+
+        url = state_data["data"].get("url")
+
+        if not url:
+            bot.send_message(
+                call.message.chat.id,
+                "❌ URL not found."
+            )
+            clear_state(user_id)
+            return
+
+        clear_state(user_id)
+
+        start_download(
+            user_id=user_id,
+            chat_id=call.message.chat.id,
+            url=url,
+            download_type="mp3",
+            quality=quality
+        )
+
+        return
+
+
+# =========================================================
+# DOWNLOAD THREAD
+# =========================================================
+
+def start_download(
+    user_id,
+    chat_id,
+    url,
+    download_type,
+    quality
+):
+
+    if is_downloading(user_id):
+
+        bot.send_message(
+            chat_id,
+            "⏳ You already have a download running.\n\n"
+            "Please wait until it finishes."
+        )
+
+        return
+
+    start_download_lock(user_id)
+
+    LAST_DOWNLOAD[user_id] = {
+        "url": url,
+        "type": download_type,
+        "quality": quality
+    }
 
     thread = threading.Thread(
         target=download_worker,
         args=(
-            message,
+            user_id,
+            chat_id,
             url,
-            state,
-            event
+            download_type,
+            quality
         ),
         daemon=True
     )
-
-    ACTIVE_DOWNLOADS[
-        user_id
-    ] = thread
 
     thread.start()
 
 
 # =========================================================
-# PROGRESS
-# =========================================================
-
-def progress_message(info):
-
-    percent = info.get(
-        "percent",
-        0
-    )
-
-    try:
-        percent = float(percent)
-    except Exception:
-        percent = 0
-
-    filled = int(
-        percent / 10
-    )
-
-    if filled > 10:
-        filled = 10
-
-    bar = (
-        "█" * filled
-        + "░" * (10 - filled)
-    )
-
-    return (
-        "📥 <b>Downloading</b>\n\n"
-        f"[{bar}] {percent:.1f}%\n\n"
-        f"📦 {info.get('downloaded', '0 B')}"
-        " / "
-        f"{info.get('total', 'Unknown')}\n"
-        f"⚡ {info.get('speed', '0 B/s')}\n"
-        f"⏳ ETA: {info.get('eta', '--:--')}"
-    )
-
-
-# =========================================================
-# WORKER
+# DOWNLOAD WORKER
 # =========================================================
 
 def download_worker(
-    message,
+    user_id,
+    chat_id,
     url,
-    state,
-    event
+    download_type,
+    quality
 ):
 
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-
-    status_message = bot.send_message(
-        chat_id,
-        "🔎 <b>Starting...</b>",
-        reply_markup=cancel_menu()
-    )
-
-    last_update = [0]
-
-    def callback(info):
-
-        now = time.time()
-
-        status = info.get(
-            "status"
-        )
-
-        if status == "downloading":
-
-            if now - last_update[0] < 2:
-                return
-
-            last_update[0] = now
-
-            try:
-
-                bot.edit_message_text(
-                    progress_message(info),
-                    chat_id,
-                    status_message.message_id,
-                    parse_mode="HTML"
-                )
-
-            except Exception:
-                pass
-
-        elif status == "starting":
-
-            try:
-
-                bot.edit_message_text(
-                    (
-                        "🔄 <b>Starting download...</b>\n\n"
-                        f"Attempt "
-                        f"{info.get('attempt')}/"
-                        f"{info.get('max_attempts')}"
-                    ),
-                    chat_id,
-                    status_message.message_id,
-                    parse_mode="HTML"
-                )
-
-            except Exception:
-                pass
-
-        elif status == "processing":
-
-            try:
-
-                bot.edit_message_text(
-                    "⚙️ <b>Processing with FFmpeg...</b>",
-                    chat_id,
-                    status_message.message_id,
-                    parse_mode="HTML"
-                )
-
-            except Exception:
-                pass
-
-        elif status == "retry":
-
-            try:
-
-                bot.edit_message_text(
-                    (
-                        "⚠️ <b>Connection problem</b>\n\n"
-                        f"🔄 Retry "
-                        f"{info.get('attempt')}/"
-                        f"{info.get('max_attempts')}\n\n"
-                        "Trying again..."
-                    ),
-                    chat_id,
-                    status_message.message_id,
-                    parse_mode="HTML"
-                )
-
-            except Exception:
-                pass
-
-    downloader = Downloader(
-        progress_callback=callback,
-        cancel_event=event
-    )
-
-    path = None
+    progress_message = None
 
     try:
 
-        if state["type"] == "video_url":
+        progress_message = bot.send_message(
+            chat_id,
+            "⏳ <b>Preparing download...</b>\n"
+            "Please wait."
+        )
 
-            result = downloader.video(
+        def progress_callback(info):
+
+            nonlocal progress_message
+
+            try:
+
+                status = info.get("status")
+
+                if status == "downloading":
+
+                    downloaded = info.get(
+                        "downloaded_bytes",
+                        0
+                    )
+
+                    total = info.get(
+                        "total_bytes"
+                    ) or info.get(
+                        "total_bytes_estimate"
+                    ) or 0
+
+                    speed = info.get(
+                        "speed"
+                    )
+
+                    eta = info.get(
+                        "eta"
+                    )
+
+                    if total:
+
+                        percent = (
+                            downloaded /
+                            total *
+                            100
+                        )
+
+                        percent = min(
+                            100,
+                            max(0, percent)
+                        )
+
+                    else:
+
+                        percent = 0
+
+                    if speed:
+
+                        speed_mb = (
+                            speed / 1024 / 1024
+                        )
+
+                        speed_text = (
+                            f"{speed_mb:.2f} MB/s"
+                        )
+
+                    else:
+
+                        speed_text = "N/A"
+
+                    if eta is not None:
+                        eta_text = f"{eta}s"
+                    else:
+                        eta_text = "N/A"
+
+                    text = (
+                        "⬇️ <b>Downloading...</b>\n\n"
+                        f"Progress: <b>{percent:.1f}%</b>\n"
+                        f"Speed: <b>{speed_text}</b>\n"
+                        f"ETA: <b>{eta_text}</b>"
+                    )
+
+                    try:
+
+                        bot.edit_message_text(
+                            text,
+                            chat_id,
+                            progress_message.message_id
+                        )
+
+                    except Exception:
+                        pass
+
+                elif status == "finished":
+
+                    try:
+
+                        bot.edit_message_text(
+                            "🔄 <b>Download complete.</b>\n"
+                            "Processing file with FFmpeg...",
+                            chat_id,
+                            progress_message.message_id
+                        )
+
+                    except Exception:
+                        pass
+
+            except Exception:
+                pass
+
+        # -------------------------------------------------
+        # VIDEO
+        # -------------------------------------------------
+
+        if download_type == "video":
+
+            result = downloader.download_video(
                 url=url,
-                quality=state["quality"]
+                quality=quality,
+                progress_callback=progress_callback
             )
+
+        # -------------------------------------------------
+        # MP3
+        # -------------------------------------------------
 
         else:
 
-            result = downloader.mp3(
+            result = downloader.download_mp3(
                 url=url,
-                quality=state["quality"]
+                quality=quality,
+                progress_callback=progress_callback
             )
 
-        if event.is_set():
-            raise DownloadCancelled()
-
-        if not result.get("success"):
-
-            bot.send_message(
-                chat_id,
-                (
-                    "❌ <b>Download Failed</b>\n\n"
-                    f"<code>"
-                    f"{result.get('error', 'Unknown error')[:1000]}"
-                    f"</code>"
-                ),
-                reply_markup=user_menu(
-                    user_id
-                )
-            )
-
-            return
-
-        path = result["path"]
-
-        if not os.path.exists(path):
+        if not result:
 
             raise RuntimeError(
-                "Output file does not exist."
+                "Downloader returned no result."
             )
+
+        success = result.get(
+            "success",
+            False
+        )
+
+        if not success:
+
+            error_message = result.get(
+                "error",
+                "Download failed."
+            )
+
+            raise RuntimeError(
+                str(error_message)
+            )
+
+        file_path = result.get(
+            "file_path"
+        )
+
+        title = result.get(
+            "title",
+            "NUTHH Download"
+        )
+
+        if not file_path:
+
+            raise RuntimeError(
+                "Downloaded file path was not returned."
+            )
+
+        if not os.path.exists(file_path):
+
+            raise RuntimeError(
+                "Downloaded file does not exist."
+            )
+
+        # -------------------------------------------------
+        # SEND FILE
+        # -------------------------------------------------
+
+        safe_title = html.escape(
+            str(title)
+        )
 
         try:
 
             bot.edit_message_text(
                 "📤 <b>Uploading to Telegram...</b>",
                 chat_id,
-                status_message.message_id,
-                parse_mode="HTML"
+                progress_message.message_id
             )
 
         except Exception:
             pass
 
-        if state["type"] == "video_url":
+        if download_type == "video":
 
             with open(
-                path,
+                file_path,
                 "rb"
-            ) as video:
+            ) as video_file:
 
                 bot.send_video(
                     chat_id,
-                    video,
+                    video_file,
                     caption=(
-                        "🎬 <b>NUTHH Downloader</b>\n\n"
-                        f"📌 {result.get('title', 'Video')}"
+                        "✅ <b>Download Complete</b>\n\n"
+                        f"🎬 {safe_title}\n"
+                        f"📺 Quality: {html.escape(str(quality))}"
                     ),
                     supports_streaming=True,
-                    timeout=1800
+                    timeout=300
                 )
 
         else:
 
             with open(
-                path,
+                file_path,
                 "rb"
-            ) as audio:
+            ) as audio_file:
 
                 bot.send_audio(
                     chat_id,
-                    audio,
+                    audio_file,
                     caption=(
-                        "🎵 <b>NUTHH Downloader</b>\n\n"
-                        f"📌 {result.get('title', 'Audio')}"
+                        "✅ <b>MP3 Complete</b>\n\n"
+                        f"🎵 {safe_title}\n"
+                        f"🎧 Quality: {html.escape(str(quality))} kbps"
                     ),
-                    timeout=1800
+                    timeout=300
                 )
 
-        database.increment_download(
-            user_id
-        )
-
-        bot.send_message(
-            chat_id,
-            "✅ <b>Completed!</b>",
-            reply_markup=user_menu(
-                user_id
+        try:
+            database.record_download(
+                user_id=user_id,
+                url=url,
+                download_type=download_type,
+                quality=quality
             )
-        )
+        except Exception:
+            pass
 
-    except DownloadCancelled:
+        try:
 
-        bot.send_message(
-            chat_id,
-            "❌ <b>Download cancelled.</b>",
-            reply_markup=user_menu(
-                user_id
+            bot.send_message(
+                chat_id,
+                "✅ <b>Finished.</b>",
+                reply_markup=(
+                    owner_menu()
+                    if is_owner(user_id)
+                    and get_user_mode(user_id) == "owner"
+                    else user_mode_menu()
+                )
             )
-        )
+
+        except Exception:
+            pass
 
     except Exception as error:
 
-        bot.send_message(
-            chat_id,
-            (
-                "❌ <b>Upload/Download Error</b>\n\n"
-                f"<code>{str(error)[:1000]}</code>"
-            ),
-            reply_markup=user_menu(
-                user_id
-            )
+        error_text = str(error)
+
+        print(
+            f"[DOWNLOAD ERROR] "
+            f"user={user_id}: {error_text}"
         )
+
+        try:
+
+            bot.send_message(
+                chat_id,
+                "❌ <b>Download Failed</b>\n\n"
+                f"{html.escape(error_text[:1500])}\n\n"
+                "You can use 🔄 Retry Last Download."
+            )
+
+        except Exception:
+            pass
 
     finally:
 
-        if path:
-            cleanup(path)
+        stop_download_lock(user_id)
 
-        ACTIVE_DOWNLOADS.pop(
-            user_id,
-            None
-        )
+        # Auto cleanup
+        try:
 
-        CANCEL_EVENTS.pop(
-            user_id,
-            None
-        )
+            if "file_path" in locals():
+                if file_path and os.path.exists(file_path):
+                    downloader.cleanup_file(
+                        file_path
+                    )
 
+        except Exception as cleanup_error:
 
-# =========================================================
-# ACTIVATE KEY
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "🔑 Activate Key"
-)
-def activate_button(message):
-
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "activate_key"
-    }
-
-    bot.send_message(
-        message.chat.id,
-        "🔑 <b>Send License Key</b>",
-        reply_markup=cancel_menu()
-    )
+            print(
+                f"[CLEANUP ERROR] "
+                f"{cleanup_error}"
+            )
 
 
 # =========================================================
-# ACTIVATE KEY STATE
+# LICENSE CONTROL
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        USER_STATES.get(
-            m.from_user.id,
-            {}
-        ).get("type")
-        == "activate_key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🔑 License Control"
 )
-def activate_process(message):
+def license_control(message):
 
-    user_id = message.from_user.id
-
-    success, result = database.activate_license(
-        user_id,
-        message.text
-    )
-
-    USER_STATES.pop(
-        user_id,
-        None
-    )
-
-    bot.send_message(
-        message.chat.id,
-        result,
-        reply_markup=user_menu(
-            user_id
-        )
-    )
-
-
-# =========================================================
-# ACCOUNT
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "👤 My Account"
-)
-def account(message):
-
-    row = database.get_user(
+    clear_state(
         message.from_user.id
     )
 
-    downloads = (
-        row["downloads"]
-        if row
-        else 0
-    )
-
-    license_status = (
-        "🟢 Active"
-        if can_download(
-            message.from_user.id
-        )
-        else "🔴 Inactive"
-    )
-
     bot.send_message(
         message.chat.id,
-        (
-            "👤 <b>My Account</b>\n\n"
-            f"🆔 <code>{message.from_user.id}</code>\n"
-            f"👤 @{message.from_user.username or 'None'}\n"
-            f"🔐 License: {license_status}\n"
-            f"📥 Downloads: {downloads}"
-        ),
-        reply_markup=user_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# MY DOWNLOADS
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "📊 My Downloads"
-)
-def my_downloads(message):
-
-    row = database.get_user(
-        message.from_user.id
-    )
-
-    count = (
-        row["downloads"]
-        if row
-        else 0
-    )
-
-    bot.send_message(
-        message.chat.id,
-        (
-            "📊 <b>My Downloads</b>\n\n"
-            f"📥 Total: <b>{count}</b>"
-        ),
-        reply_markup=user_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# HELP
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        m.text == "❓ Help"
-)
-def help_button(message):
-
-    bot.send_message(
-        message.chat.id,
-        (
-            "❓ <b>NUTHH Downloader</b>\n\n"
-            "🎬 Download Video\n"
-            "🎵 Download MP3\n"
-            "🔄 Retry\n"
-            "📥 Resume\n"
-            "📊 Progress\n"
-            "❌ Cancel\n"
-            "⚙️ FFmpeg processing"
-        ),
-        reply_markup=user_menu(
-            message.from_user.id
-        )
-    )
-
-
-# =========================================================
-# KEY CONTROL
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🔑 Key Control"
-)
-def key_control(message):
-
-    bot.send_message(
-        message.chat.id,
-        "🔑 <b>License Key Control</b>",
-        reply_markup=key_menu()
+        "🔑 <b>License Control</b>",
+        reply_markup=license_menu()
     )
 
 
@@ -1211,145 +1392,127 @@ def key_control(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "➕ Generate Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "➕ Generate Key"
 )
-def generate_key(message):
+def generate_key_button(message):
 
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "generate_key"
-    }
+    set_state(
+        message.from_user.id,
+        "generate_key"
+    )
+
+    keyboard = types.ReplyKeyboardMarkup(
+        resize_keyboard=True
+    )
+
+    keyboard.row(
+        "1 Minute",
+        "10 Minutes"
+    )
+
+    keyboard.row(
+        "1 Hour",
+        "1 Day"
+    )
+
+    keyboard.row(
+        "7 Days",
+        "30 Days"
+    )
+
+    keyboard.row(
+        "90 Days",
+        "1 Year"
+    )
+
+    keyboard.row(
+        "Lifetime",
+        "🔙 License Control"
+    )
 
     bot.send_message(
         message.chat.id,
-        "⏰ <b>Select License Duration</b>",
-        reply_markup=duration_menu()
+        "➕ <b>Generate License Key</b>\n\n"
+        "Select duration:",
+        reply_markup=keyboard
     )
 
 
 # =========================================================
-# CREATE KEY
+# GENERATE KEY DURATION
 # =========================================================
 
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text in DURATIONS
-)
-def create_key(message):
+DURATION_MAP = {
+    "1 Minute": 1,
+    "10 Minutes": 10,
+    "1 Hour": 60,
+    "1 Day": 1440,
+    "7 Days": 10080,
+    "30 Days": 43200,
+    "90 Days": 129600,
+    "1 Year": 525600,
+}
 
-    minutes = DURATIONS[
-        message.text
-    ]
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text in DURATION_MAP
+)
+def generate_key_duration(message):
+
+    user_id = message.from_user.id
 
     try:
 
-        key = database.generate_license(
-            minutes
+        minutes = DURATION_MAP[
+            message.text
+        ]
+
+        result = license.generate_key(
+            duration_minutes=minutes
         )
 
-        if minutes is None:
+        if isinstance(result, dict):
 
-            duration = "♾️ Lifetime"
+            key = result.get(
+                "key",
+                "Unknown"
+            )
 
-        elif minutes < 60:
-
-            duration = f"{minutes} minutes"
-
-        elif minutes < 1440:
-
-            duration = (
-                f"{minutes // 60} hours"
+            expires = result.get(
+                "expires_at",
+                "Unknown"
             )
 
         else:
 
-            duration = (
-                f"{minutes // 1440} days"
-            )
-
-        USER_STATES.pop(
-            message.from_user.id,
-            None
-        )
+            key = str(result)
+            expires = "Unknown"
 
         bot.send_message(
             message.chat.id,
-            (
-                "✅ <b>License Created</b>\n\n"
-                f"🔑 <code>{key}</code>\n\n"
-                f"⏰ Duration: <b>{duration}</b>\n"
-                "👥 Users: Unlimited\n"
-                "📱 Devices: Unlimited"
-            ),
-            reply_markup=key_menu()
+            "✅ <b>License Key Created</b>\n\n"
+            f"🔑 <code>{html.escape(str(key))}</code>\n"
+            f"⏱ Duration: {html.escape(message.text)}\n"
+            f"📅 Expires: {html.escape(str(expires))}",
+            reply_markup=license_menu()
         )
 
     except Exception as error:
 
         bot.send_message(
             message.chat.id,
-            (
-                "❌ <b>Key Creation Failed</b>\n\n"
-                f"<code>{str(error)}</code>"
-            ),
-            reply_markup=key_menu()
+            "❌ <b>Could not generate key.</b>\n\n"
+            f"{html.escape(str(error))}",
+            reply_markup=license_menu()
         )
 
+    finally:
 
-# =========================================================
-# ALL KEYS
-# =========================================================
-
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "📋 All Keys"
-)
-def all_keys(message):
-
-    rows = database.list_licenses()
-
-    if not rows:
-
-        bot.send_message(
-            message.chat.id,
-            "📋 No license keys.",
-            reply_markup=key_menu()
-        )
-
-        return
-
-    text = "📋 <b>License Keys</b>\n\n"
-
-    for row in rows[:50]:
-
-        status = (
-            "🟢 Enabled"
-            if row["enabled"]
-            else "🔴 Disabled"
-        )
-
-        expiry = (
-            "♾️ Lifetime"
-            if row["expires_at"] is None
-            else row["expires_at"][:19]
-        )
-
-        text += (
-            f"{status}\n"
-            f"🔑 <code>{row['license_key']}</code>\n"
-            f"⏰ {expiry}\n\n"
-        )
-
-    bot.send_message(
-        message.chat.id,
-        text[:4000],
-        reply_markup=key_menu()
-    )
+        clear_state(user_id)
 
 
 # =========================================================
@@ -1357,22 +1520,20 @@ def all_keys(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🔍 Search Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🔍 Search Key"
 )
-def search_key(message):
+def search_key_button(message):
 
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "search_key"
-    }
+    set_state(
+        message.from_user.id,
+        "search_key"
+    )
 
     bot.send_message(
         message.chat.id,
-        "🔍 Send license key:",
-        reply_markup=key_menu()
+        "🔍 Send the license key to search."
     )
 
 
@@ -1381,369 +1542,360 @@ def search_key(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "⏰ Extend Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏱ Extend Key"
 )
-def extend_key_start(message):
+def extend_key_button(message):
 
-    USER_STATES[
-        message.from_user.id
-    ] = {
-        "type": "extend_key"
-    }
+    set_state(
+        message.from_user.id,
+        "extend_key"
+    )
 
     bot.send_message(
         message.chat.id,
-        "🔑 Send license key:",
-        reply_markup=key_menu()
+        "⏱ Send the license key you want to extend."
     )
 
 
 # =========================================================
-# ENABLE
+# EXTEND DURATION
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🟢 Enable Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏱ 1 Day"
 )
-def enable_key_start(message):
+def extend_one_day(message):
 
-    USER_STATES[
+    state_data = get_state(
         message.from_user.id
-    ] = {
-        "type": "enable_key"
-    }
+    )
 
-    bot.send_message(
-        message.chat.id,
-        "🔑 Send license key:",
-        reply_markup=key_menu()
+    if not state_data:
+        return
+
+    if state_data["state"] != "extend_duration":
+        return
+
+    process_extend_key(
+        message,
+        1440
     )
 
 
-# =========================================================
-# DISABLE
-# =========================================================
-
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🔴 Disable Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏱ 7 Days"
 )
-def disable_key_start(message):
+def extend_seven_days(message):
 
-    USER_STATES[
+    state_data = get_state(
         message.from_user.id
-    ] = {
-        "type": "disable_key"
-    }
+    )
 
-    bot.send_message(
-        message.chat.id,
-        "🔑 Send license key:",
-        reply_markup=key_menu()
+    if not state_data:
+        return
+
+    if state_data["state"] != "extend_duration":
+        return
+
+    process_extend_key(
+        message,
+        10080
     )
 
 
-# =========================================================
-# DELETE
-# =========================================================
-
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🗑️ Delete Key"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏱ 30 Days"
 )
-def delete_key_start(message):
+def extend_thirty_days(message):
 
-    USER_STATES[
+    state_data = get_state(
         message.from_user.id
-    ] = {
-        "type": "delete_key"
-    }
+    )
 
-    bot.send_message(
-        message.chat.id,
-        "🔑 Send license key:",
-        reply_markup=key_menu()
+    if not state_data:
+        return
+
+    if state_data["state"] != "extend_duration":
+        return
+
+    process_extend_key(
+        message,
+        43200
     )
 
 
-# =========================================================
-# KEY STATE HANDLER
-# =========================================================
-
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and USER_STATES.get(
-            m.from_user.id,
-            {}
-        ).get("type")
-        in [
-            "search_key",
-            "extend_key",
-            "enable_key",
-            "disable_key",
-            "delete_key"
-        ]
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏱ 1 Year"
 )
-def key_state(message):
+def extend_one_year(message):
+
+    state_data = get_state(
+        message.from_user.id
+    )
+
+    if not state_data:
+        return
+
+    if state_data["state"] != "extend_duration":
+        return
+
+    process_extend_key(
+        message,
+        525600
+    )
+
+
+def process_extend_key(message, minutes):
 
     user_id = message.from_user.id
 
-    state = USER_STATES.get(
-        user_id
+    state_data = get_state(user_id)
+
+    if not state_data:
+        return
+
+    key = state_data["data"].get(
+        "key"
     )
 
-    action = state["type"]
+    if not key:
 
-    key = message.text.strip()
-
-    if action == "search_key":
-
-        row = database.get_license(
-            key
+        bot.send_message(
+            message.chat.id,
+            "❌ Key not found."
         )
 
-        USER_STATES.pop(
-            user_id,
-            None
+        clear_state(user_id)
+        return
+
+    try:
+
+        result = license.extend_key(
+            key,
+            minutes
         )
 
-        if not row:
+        if isinstance(result, dict):
+            success = result.get(
+                "success",
+                False
+            )
+            msg = result.get(
+                "message",
+                ""
+            )
+        else:
+            success = True
+            msg = str(result)
 
-            text = "❌ Key not found."
+        if success:
+
+            bot.send_message(
+                message.chat.id,
+                "✅ <b>License Extended</b>\n\n"
+                f"🔑 <code>{html.escape(key)}</code>\n"
+                f"⏱ Added: {minutes} minutes\n"
+                f"{html.escape(str(msg))}",
+                reply_markup=license_menu()
+            )
 
         else:
 
-            status = (
-                "🟢 Enabled"
-                if row["enabled"]
-                else "🔴 Disabled"
+            bot.send_message(
+                message.chat.id,
+                "❌ Extension failed.\n\n"
+                f"{html.escape(str(msg))}",
+                reply_markup=license_menu()
             )
 
-            expiry = (
-                "♾️ Lifetime"
-                if row["expires_at"] is None
-                else row["expires_at"]
-            )
-
-            text = (
-                "🔍 <b>Key Information</b>\n\n"
-                f"🔑 <code>{row['license_key']}</code>\n"
-                f"📌 {status}\n"
-                f"⏰ {expiry}"
-            )
+    except Exception as error:
 
         bot.send_message(
             message.chat.id,
-            text,
-            reply_markup=key_menu()
+            "❌ Extension failed.\n\n"
+            f"{html.escape(str(error))}",
+            reply_markup=license_menu()
         )
 
-        return
+    clear_state(user_id)
 
-    if action == "enable_key":
 
-        success = database.enable_license(
-            key
-        )
+# =========================================================
+# DISABLE KEY
+# =========================================================
 
-        USER_STATES.pop(
-            user_id,
-            None
-        )
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🚫 Disable Key"
+)
+def disable_key_button(message):
 
-        bot.send_message(
-            message.chat.id,
-            (
-                "🟢 Key enabled."
-                if success
-                else "❌ Key not found."
-            ),
-            reply_markup=key_menu()
-        )
+    set_state(
+        message.from_user.id,
+        "disable_key"
+    )
 
-        return
+    bot.send_message(
+        message.chat.id,
+        "🚫 Send the key to disable."
+    )
 
-    if action == "disable_key":
 
-        success = database.disable_license(
-            key
-        )
+# =========================================================
+# ENABLE KEY
+# =========================================================
 
-        USER_STATES.pop(
-            user_id,
-            None
-        )
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🟢 Enable Key"
+)
+def enable_key_button(message):
 
-        bot.send_message(
-            message.chat.id,
-            (
-                "🔴 Key disabled."
-                if success
-                else "❌ Key not found."
-            ),
-            reply_markup=key_menu()
-        )
+    set_state(
+        message.from_user.id,
+        "enable_key"
+    )
 
-        return
+    bot.send_message(
+        message.chat.id,
+        "🟢 Send the key to enable."
+    )
 
-    if action == "delete_key":
 
-        success = database.delete_license(
-            key
-        )
+# =========================================================
+# DELETE KEY
+# =========================================================
 
-        USER_STATES.pop(
-            user_id,
-            None
-        )
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🗑 Delete Key"
+)
+def delete_key_button(message):
 
-        bot.send_message(
-            message.chat.id,
-            (
-                "🗑️ Key deleted."
-                if success
-                else "❌ Key not found."
-            ),
-            reply_markup=key_menu()
-        )
+    set_state(
+        message.from_user.id,
+        "delete_key"
+    )
 
-        return
+    bot.send_message(
+        message.chat.id,
+        "🗑 Send the key to delete."
+    )
 
-    if action == "extend_key":
 
-        try:
+# =========================================================
+# LIST KEYS
+# =========================================================
 
-            minutes = int(key)
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "📋 List Keys"
+)
+def list_keys_button(message):
 
-            USER_STATES[
-                user_id
-            ] = {
-                "type": "extend_key_duration",
-                "key": minutes
-            }
+    try:
+
+        keys = database.get_all_license_keys()
+
+        if not keys:
 
             bot.send_message(
                 message.chat.id,
-                "🔑 Now send the license key.",
-                reply_markup=key_menu()
+                "📋 No license keys found."
             )
 
-        except ValueError:
+            return
 
-            bot.send_message(
-                message.chat.id,
-                "❌ Enter duration in minutes.",
-                reply_markup=key_menu()
-            )
+        text = "📋 <b>License Keys</b>\n\n"
 
+        for item in keys[:50]:
 
-# =========================================================
-# BOT CONTROL
-# =========================================================
+            if isinstance(item, dict):
 
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🤖 Bot Control"
-)
-def bot_control(message):
+                key = item.get(
+                    "key",
+                    ""
+                )
 
-    bot.send_message(
-        message.chat.id,
-        "🤖 <b>Bot Control</b>",
-        reply_markup=bot_control_menu()
-    )
+                status = item.get(
+                    "status",
+                    ""
+                )
 
+                expires = item.get(
+                    "expires_at",
+                    ""
+                )
 
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "▶️ Start Bot"
-)
-def start_bot(message):
+                text += (
+                    f"🔑 <code>{html.escape(str(key))}</code>\n"
+                    f"Status: {html.escape(str(status))}\n"
+                    f"Expires: {html.escape(str(expires))}\n\n"
+                )
 
-    global BOT_RUNNING
+        bot.send_message(
+            message.chat.id,
+            text
+        )
 
-    BOT_RUNNING = True
+    except Exception as error:
 
-    bot.send_message(
-        message.chat.id,
-        "🟢 <b>Bot is running.</b>",
-        reply_markup=bot_control_menu()
-    )
-
-
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "⏸️ Stop Bot"
-)
-def stop_bot(message):
-
-    global BOT_RUNNING
-
-    BOT_RUNNING = False
-
-    bot.send_message(
-        message.chat.id,
-        (
-            "⏸️ <b>Bot stopped for users.</b>\n\n"
-            "👑 Owner controls are still available."
-        ),
-        reply_markup=bot_control_menu()
-    )
-
-
-@bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "📊 Bot Status"
-)
-def bot_status(message):
-
-    status = (
-        "🟢 Running"
-        if BOT_RUNNING
-        else "🔴 Stopped"
-    )
-
-    bot.send_message(
-        message.chat.id,
-        f"🤖 Status: <b>{status}</b>",
-        reply_markup=bot_control_menu()
-    )
+        bot.send_message(
+            message.chat.id,
+            "❌ Could not load keys.\n\n"
+            f"{html.escape(str(error))}"
+        )
 
 
 # =========================================================
-# STATISTICS
+# KEY STATISTICS
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "📊 Statistics"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "📊 Key Statistics"
 )
-def statistics(message):
+def key_statistics(message):
 
-    bot.send_message(
-        message.chat.id,
-        (
-            "📊 <b>Statistics</b>\n\n"
-            f"👥 Users: <b>{database.total_users()}</b>\n"
-            f"📥 Downloads: <b>{database.total_downloads()}</b>\n"
-            f"🔑 Keys: <b>{database.license_count()}</b>\n"
-            f"🟢 Active Keys: "
-            f"<b>{database.active_license_count()}</b>"
-        ),
-        reply_markup=owner_menu()
-    )
+    try:
+
+        stats = database.get_license_statistics()
+
+        text = (
+            "📊 <b>License Statistics</b>\n\n"
+            f"🔑 Total Keys: {stats.get('total', 0)}\n"
+            f"🟢 Active: {stats.get('active', 0)}\n"
+            f"🚫 Disabled: {stats.get('disabled', 0)}\n"
+            f"👥 Activated Users: {stats.get('users', 0)}"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as error:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Could not load statistics.\n\n"
+            f"{html.escape(str(error))}"
+        )
 
 
 # =========================================================
@@ -1751,11 +1903,15 @@ def statistics(message):
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "👥 User Management"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "👥 User Management"
 )
-def users_menu(message):
+def user_management(message):
+
+    clear_state(
+        message.from_user.id
+    )
 
     bot.send_message(
         message.chat.id,
@@ -1764,200 +1920,741 @@ def users_menu(message):
     )
 
 
+# =========================================================
+# LIST USERS
+# =========================================================
+
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "👥 All Users"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "👥 List Users"
 )
-def all_users(message):
+def list_users(message):
 
-    rows = database.all_users()
+    try:
 
-    if not rows:
+        users = database.get_all_users()
 
-        text = "No users."
+        if not users:
 
-    else:
+            bot.send_message(
+                message.chat.id,
+                "👥 No users found."
+            )
+
+            return
 
         text = "👥 <b>Users</b>\n\n"
 
-        for row in rows[:50]:
+        for user in users[:50]:
 
-            status = (
-                "🚫"
-                if row["blocked"]
-                else "🟢"
-            )
+            if isinstance(user, dict):
 
-            text += (
-                f"{status} "
-                f"<code>{row['user_id']}</code> "
-                f"{row['username']}\n"
-            )
+                uid = user.get(
+                    "user_id",
+                    ""
+                )
 
-    bot.send_message(
-        message.chat.id,
-        text[:4000],
-        reply_markup=user_management_menu()
-    )
+                username = user.get(
+                    "username",
+                    ""
+                )
 
+                name = user.get(
+                    "first_name",
+                    ""
+                )
+
+                banned = user.get(
+                    "banned",
+                    False
+                )
+
+                status = (
+                    "🚫 Banned"
+                    if banned
+                    else "🟢 Active"
+                )
+
+                text += (
+                    f"ID: <code>{uid}</code>\n"
+                    f"Username: @{html.escape(str(username))}\n"
+                    f"Name: {html.escape(str(name))}\n"
+                    f"Status: {status}\n\n"
+                )
+
+        bot.send_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as error:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Could not load users.\n\n"
+            f"{html.escape(str(error))}"
+        )
+
+
+# =========================================================
+# SEARCH USER
+# =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "📊 User Statistics"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🔍 Search User"
 )
-def user_statistics(message):
+def search_user_button(message):
+
+    set_state(
+        message.from_user.id,
+        "search_user"
+    )
 
     bot.send_message(
         message.chat.id,
-        (
-            "👥 <b>User Statistics</b>\n\n"
-            f"Users: <b>{database.total_users()}</b>"
-        ),
-        reply_markup=user_management_menu()
+        "🔍 Send User ID or username."
     )
 
 
 # =========================================================
-# SETTINGS
+# BAN USER
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "⚙️ Settings"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🚫 Ban User"
 )
-def settings(message):
+def ban_user_button(message):
+
+    set_state(
+        message.from_user.id,
+        "ban_user"
+    )
 
     bot.send_message(
         message.chat.id,
-        (
-            "⚙️ <b>Settings</b>\n\n"
-            f"🔄 Retries: {config.MAX_RETRIES}\n"
-            f"⏱ Timeout: {config.DOWNLOAD_TIMEOUT}s\n"
-            "🎬 Video: yt-dlp\n"
-            "🎞️ Processing: FFmpeg\n"
-            "💾 Database: SQLite"
-        ),
-        reply_markup=owner_menu()
+        "🚫 Send the User ID to ban."
     )
 
 
 # =========================================================
-# OWNER MENU
+# UNBAN USER
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m:
-        is_owner(m.from_user.id)
-        and m.text == "🔙 Owner Menu"
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🟢 Unban User"
+)
+def unban_user_button(message):
+
+    set_state(
+        message.from_user.id,
+        "unban_user"
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🟢 Send the User ID to unban."
+    )
+
+
+# =========================================================
+# STATISTICS
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "📊 Statistics"
+)
+def statistics_button(message):
+
+    try:
+
+        stats = database.get_statistics()
+
+        text = (
+            "📊 <b>NUTHH Statistics</b>\n\n"
+            f"👥 Users: {stats.get('users', 0)}\n"
+            f"⬇️ Downloads: {stats.get('downloads', 0)}\n"
+            f"🎬 Videos: {stats.get('videos', 0)}\n"
+            f"🎵 MP3: {stats.get('mp3', 0)}"
+        )
+
+        bot.send_message(
+            message.chat.id,
+            text
+        )
+
+    except Exception as error:
+
+        bot.send_message(
+            message.chat.id,
+            "❌ Statistics unavailable.\n\n"
+            f"{html.escape(str(error))}"
+        )
+
+
+# =========================================================
+# BOT CONTROL
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⚙️ Bot Control"
+)
+def bot_control(message):
+
+    bot.send_message(
+        message.chat.id,
+        "⚙️ <b>Bot Control</b>",
+        reply_markup=bot_control_menu()
+    )
+
+
+# =========================================================
+# START BOT
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "▶️ Start Bot"
+)
+def start_bot_button(message):
+
+    set_bot_status(True)
+
+    bot.send_message(
+        message.chat.id,
+        "▶️ <b>Bot Started</b>\n\n"
+        "Users can now use the downloader.",
+        reply_markup=bot_control_menu()
+    )
+
+
+# =========================================================
+# STOP BOT
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "⏹ Stop Bot"
+)
+def stop_bot_button(message):
+
+    set_bot_status(False)
+
+    bot.send_message(
+        message.chat.id,
+        "⏹ <b>Bot Stopped</b>\n\n"
+        "User downloading is disabled.\n"
+        "Owner controls remain available.",
+        reply_markup=bot_control_menu()
+    )
+
+
+# =========================================================
+# BOT STATUS
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "📊 Bot Status"
+)
+def bot_status_button(message):
+
+    if BOT_RUNNING:
+
+        status = "🟢 RUNNING"
+
+    else:
+
+        status = "🔴 STOPPED"
+
+    bot.send_message(
+        message.chat.id,
+        f"⚙️ <b>Bot Status</b>\n\n"
+        f"Status: {status}"
+    )
+
+
+# =========================================================
+# OWNER MENU BACK
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🔙 Owner Menu"
 )
 def owner_menu_back(message):
 
-    USER_STATES.pop(
-        message.from_user.id,
-        None
+    clear_state(
+        message.from_user.id
     )
 
-    database.set_mode(
+    set_user_mode(
         message.from_user.id,
         "owner"
     )
 
     bot.send_message(
         message.chat.id,
-        "👑 <b>Owner Control Panel</b>",
+        "👑 <b>Owner Menu</b>",
         reply_markup=owner_menu()
     )
 
 
 # =========================================================
-# FALLBACK
+# LICENSE CONTROL BACK
 # =========================================================
 
 @bot.message_handler(
-    func=lambda m: True
+    func=lambda message:
+    is_owner(message.from_user.id)
+    and message.text == "🔙 License Control"
 )
-def fallback(message):
+def license_control_back(message):
 
-    register(message)
+    clear_state(
+        message.from_user.id
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "🔑 <b>License Control</b>",
+        reply_markup=license_menu()
+    )
+
+
+# =========================================================
+# SEARCH / EXTEND / KEY ACTION STATES
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message:
+    is_owner(message.from_user.id)
+)
+def owner_state_handler(message):
 
     user_id = message.from_user.id
+    state_data = get_state(user_id)
 
-    if (
-        not is_owner(user_id)
-        and not BOT_RUNNING
-    ):
+    if not state_data:
+        return
+
+    state = state_data["state"]
+
+    # -----------------------------------------------------
+    # SEARCH KEY
+    # -----------------------------------------------------
+
+    if state == "search_key":
+
+        key = message.text.strip()
+
+        try:
+
+            result = database.get_license_by_key(
+                key
+            )
+
+            if not result:
+
+                bot.send_message(
+                    message.chat.id,
+                    "❌ Key not found."
+                )
+
+            else:
+
+                bot.send_message(
+                    message.chat.id,
+                    "🔍 <b>Key Information</b>\n\n"
+                    f"🔑 <code>{html.escape(str(result.get('key', key)))}</code>\n"
+                    f"Status: {html.escape(str(result.get('status', '')))}\n"
+                    f"Expires: {html.escape(str(result.get('expires_at', '')))}\n"
+                    f"Activations: {result.get('activations', 0)}"
+                )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Search failed.\n\n"
+                f"{html.escape(str(error))}"
+            )
+
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # EXTEND KEY
+    # -----------------------------------------------------
+
+    if state == "extend_key":
+
+        key = message.text.strip()
+
+        set_state(
+            user_id,
+            "extend_duration",
+            {
+                "key": key
+            }
+        )
+
+        keyboard = types.ReplyKeyboardMarkup(
+            resize_keyboard=True
+        )
+
+        keyboard.row(
+            "⏱ 1 Day",
+            "⏱ 7 Days"
+        )
+
+        keyboard.row(
+            "⏱ 30 Days",
+            "⏱ 1 Year"
+        )
+
+        keyboard.row(
+            "🔙 License Control"
+        )
 
         bot.send_message(
             message.chat.id,
-            "⏸️ Bot is currently stopped.",
-            reply_markup=user_menu(
-                user_id
-            )
+            "⏱ <b>Select extension duration:</b>",
+            reply_markup=keyboard
         )
 
         return
 
-    if is_owner(user_id):
+    # -----------------------------------------------------
+    # DISABLE KEY
+    # -----------------------------------------------------
 
-        mode = database.get_mode(
-            user_id
-        )
+    if state == "disable_key":
 
-        if mode == "owner":
+        key = message.text.strip()
 
-            bot.send_message(
-                message.chat.id,
-                "👇 Use Owner Menu.",
-                reply_markup=owner_menu()
+        try:
+
+            result = license.disable_key(
+                key
             )
 
-        else:
+            bot.send_message(
+                message.chat.id,
+                "🚫 <b>Key Disabled</b>\n\n"
+                f"🔑 <code>{html.escape(key)}</code>\n\n"
+                f"{html.escape(str(result))}",
+                reply_markup=license_menu()
+            )
+
+        except Exception as error:
 
             bot.send_message(
                 message.chat.id,
-                "👇 Use User Menu.",
-                reply_markup=user_menu(
-                    user_id
+                "❌ Could not disable key.\n\n"
+                f"{html.escape(str(error))}",
+                reply_markup=license_menu()
+            )
+
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # ENABLE KEY
+    # -----------------------------------------------------
+
+    if state == "enable_key":
+
+        key = message.text.strip()
+
+        try:
+
+            result = license.enable_key(
+                key
+            )
+
+            bot.send_message(
+                message.chat.id,
+                "🟢 <b>Key Enabled</b>\n\n"
+                f"🔑 <code>{html.escape(key)}</code>\n\n"
+                f"{html.escape(str(result))}",
+                reply_markup=license_menu()
+            )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Could not enable key.\n\n"
+                f"{html.escape(str(error))}",
+                reply_markup=license_menu()
+            )
+
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # DELETE KEY
+    # -----------------------------------------------------
+
+    if state == "delete_key":
+
+        key = message.text.strip()
+
+        try:
+
+            result = license.delete_key(
+                key
+            )
+
+            bot.send_message(
+                message.chat.id,
+                "🗑 <b>Key Deleted</b>\n\n"
+                f"🔑 <code>{html.escape(key)}</code>\n\n"
+                f"{html.escape(str(result))}",
+                reply_markup=license_menu()
+            )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Could not delete key.\n\n"
+                f"{html.escape(str(error))}",
+                reply_markup=license_menu()
+            )
+
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # SEARCH USER
+    # -----------------------------------------------------
+
+    if state == "search_user":
+
+        query = message.text.strip()
+
+        try:
+
+            result = database.search_user(
+                query
+            )
+
+            if not result:
+
+                bot.send_message(
+                    message.chat.id,
+                    "❌ User not found."
                 )
+
+            else:
+
+                bot.send_message(
+                    message.chat.id,
+                    "🔍 <b>User Found</b>\n\n"
+                    f"ID: <code>{result.get('user_id', '')}</code>\n"
+                    f"Username: @{html.escape(str(result.get('username', '')))}\n"
+                    f"Name: {html.escape(str(result.get('first_name', '')))}"
+                )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Search failed.\n\n"
+                f"{html.escape(str(error))}"
             )
 
-    else:
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # BAN USER
+    # -----------------------------------------------------
+
+    if state == "ban_user":
+
+        try:
+
+            target_id = int(
+                message.text.strip()
+            )
+
+            if target_id == OWNER_ID:
+
+                bot.send_message(
+                    message.chat.id,
+                    "❌ Owner cannot be banned."
+                )
+
+            else:
+
+                database.set_user_banned(
+                    target_id,
+                    True
+                )
+
+                bot.send_message(
+                    message.chat.id,
+                    "🚫 <b>User Banned</b>\n\n"
+                    f"User ID: <code>{target_id}</code>"
+                )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Invalid User ID.\n\n"
+                f"{html.escape(str(error))}"
+            )
+
+        clear_state(user_id)
+        return
+
+    # -----------------------------------------------------
+    # UNBAN USER
+    # -----------------------------------------------------
+
+    if state == "unban_user":
+
+        try:
+
+            target_id = int(
+                message.text.strip()
+            )
+
+            database.set_user_banned(
+                target_id,
+                False
+            )
+
+            bot.send_message(
+                message.chat.id,
+                "🟢 <b>User Unbanned</b>\n\n"
+                f"User ID: <code>{target_id}</code>"
+            )
+
+        except Exception as error:
+
+            bot.send_message(
+                message.chat.id,
+                "❌ Invalid User ID.\n\n"
+                f"{html.escape(str(error))}"
+            )
+
+        clear_state(user_id)
+        return
+
+
+# =========================================================
+# BAN CHECK
+# =========================================================
+
+@bot.message_handler(
+    func=lambda message: True,
+    content_types=[
+        "text",
+        "photo",
+        "video",
+        "audio",
+        "document"
+    ]
+)
+def fallback_handler(message):
+
+    user_id = message.from_user.id
+
+    # Owner always allowed
+    if is_owner(user_id):
+        return
+
+    # Check banned user
+    try:
+
+        if database.is_user_banned(user_id):
+
+            bot.send_message(
+                message.chat.id,
+                "🚫 <b>Your account is blocked.</b>"
+            )
+
+            return
+
+    except Exception:
+        pass
+
+    # Bot stopped
+    if not BOT_RUNNING:
 
         bot.send_message(
             message.chat.id,
-            "👇 Please use the menu buttons.",
-            reply_markup=user_menu(
-                user_id
-            )
+            "⏹ <b>Downloader is currently stopped.</b>"
         )
 
+        return
+
+    # Unknown message
+    bot.send_message(
+        message.chat.id,
+        "ℹ️ Please use the menu buttons.",
+        reply_markup=user_menu()
+    )
+
 
 # =========================================================
-# RUN
+# RUN BOT
 # =========================================================
 
-print(
-    "======================================"
-)
+if __name__ == "__main__":
 
-print(
-    " NUTHH TikTok Downloader Bot"
-)
+    print("=" * 50)
+    print("NUTHH TikTok Downloader Bot")
+    print("=" * 50)
+    print("Bot is starting...")
+    print("Repeated-message warning: DISABLED")
+    print("Spam warning system: DISABLED")
+    print("Owner ID:", OWNER_ID)
+    print("=" * 50)
 
-print(
-    " Bot is running..."
-)
+    while True:
 
-print(
-    "======================================"
-)
+        try:
 
+            bot.infinity_polling(
+                skip_pending=True,
+                timeout=60,
+                long_polling_timeout=60
+            )
 
-bot.infinity_polling(
-    skip_pending=True,
-    timeout=60,
-    long_polling_timeout=60
-)
+        except KeyboardInterrupt:
+
+            print("Bot stopped by user.")
+            break
+
+        except Exception as error:
+
+            print(
+                "[BOT ERROR]",
+                error
+            )
+
+            print(
+                "Restarting polling in 5 seconds..."
+            )
+
+            time.sleep(5)
